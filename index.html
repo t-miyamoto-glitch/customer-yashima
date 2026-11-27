@@ -197,7 +197,9 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
     view: 'inv',                          // 'inv' 請求書から見る / 'pur' 仕入データから見る
     pmarks: new Set(['○', '△', '×']),    // 仕入データから見るときの表示マーク
     pchk: {}, pmemo: {},                  // 仕入行ごとの確認チェック・メモ（キー = 仕入データの行番号）
+    limit: 300,                           // 一度に表示する行数（多すぎると画面が重くなる）
   };
+  const PAGE = 300;
 
   // ------------------------------------------------------------ ファイル読み込み
   function setupDrop(el, key) {
@@ -231,12 +233,45 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
     return new Date().getFullYear();
   }
 
-  $('#run').addEventListener('click', () => {
+  // 照合は Web Worker（画面とは別の処理）で動かし、件数が多くても画面が固まらないようにする。
+  // Worker が使えない環境では、画面に「照合中」を出してからそのまま実行する。
+  function runMatch(P, V, opt, onProgress) {
+    return new Promise((resolve, reject) => {
+      let worker = null;
+      try {
+        const src = 'const Matcher = (' + Matcher.__factory.toString() + ')();\n'
+          + 'onmessage = (e) => { try { const d = e.data; const res = Matcher.match(d.P, d.V, Object.assign({}, d.opt, { onProgress: (x) => postMessage({ progress: x }) })); postMessage({ res }); } catch (err) { postMessage({ error: String(err && err.message || err) }); } };';
+        const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+        worker = new Worker(url);
+        URL.revokeObjectURL(url);
+      } catch (e) { worker = null; }
+      const inline = () => setTimeout(() => {
+        try { resolve(Matcher.match(P, V, Object.assign({}, opt, { onProgress }))); } catch (e) { reject(e); }
+      }, 30);
+      if (!worker) return inline();
+      worker.onmessage = (e) => {
+        if (e.data.progress != null) return onProgress(e.data.progress);
+        worker.terminate();
+        if (e.data.error) reject(new Error(e.data.error)); else resolve(e.data.res);
+      };
+      worker.onerror = (e) => { e.preventDefault(); worker.terminate(); inline(); };
+      worker.postMessage({ P, V, opt });
+    });
+  }
+
+  $('#run').addEventListener('click', async () => {
     $('#err').textContent = '';
+    const btn = $('#run');
+    btn.disabled = true;
+    const label = btn.textContent;
+    btn.textContent = '照合中…';
     try {
       const inv = Readers.readInvoices(XLSX, state.inv.wb);
       const pur = Readers.readPurchases(XLSX, state.pur.wb);
-      const res = Matcher.match(pur.rows, inv.rows, { year: guessYear(pur.rows) });
+      $('#saved').textContent = `請求 ${inv.rows.length} 行 × 仕入 ${pur.rows.length} 行を照合しています…`;
+      const res = await runMatch(pur.rows, inv.rows, { year: guessYear(pur.rows) },
+        (x) => { btn.textContent = `照合中… ${Math.round(x * 100)}%`; });
+      state.limit = PAGE;
       state.header = inv.header || {};
       state.rows = res.rows.filter((r) => r.v.length);
       state.pool = res.rows.filter((r) => !r.v.length).flatMap((r) => r.p.map((p) => Object.assign(p, { _poolStatus: r.status })));
@@ -250,12 +285,22 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
     } catch (e) {
       console.error(e);
       $('#err').textContent = e.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
     }
   });
 
   // ------------------------------------------------------------ 行の付け替え
   const rowKey = (r) => r.v.map((v) => v.id).join('+');
-  const ownerOf = (p) => state.rows.find((r) => r.kind === 'pair' && r.p.includes(p));
+  // 仕入行 → それを使っている請求行（表示のたびに作り直す）
+  const ownerOf = (p) => {
+    if (!state.owner) {
+      state.owner = new Map();
+      for (const r of state.rows) if (r.kind === 'pair') for (const q of r.p) state.owner.set(q, r);
+    }
+    return state.owner.get(p);
+  };
 
   function asUnmatched(r) {
     const u = {
@@ -278,6 +323,7 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
     return n;
   }
   function replaceRow(oldRow, newRow) {
+    state.owner = null;
     const i = state.rows.indexOf(oldRow);
     if (i >= 0) state.rows[i] = newRow;
   }
@@ -367,6 +413,8 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
   };
 
   function render() {
+    state.owner = null;
+    state.vRow = null;
     document.querySelectorAll('#viewSw button').forEach((b) => b.classList.toggle('on', b.dataset.view === state.view));
     $('#refBox').hidden = state.view === 'pur';
     $('#bulk2').textContent = state.view === 'pur' ? '○ をまとめて確認済みに' : '○ をまとめて消込';
@@ -409,9 +457,15 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
     if (!view.length) {
       $('#tbl').innerHTML = head + `<tr><td colspan="14" class="empty">${rows.some((r) => !r.checked) ? '該当する行はありません（上のマークをクリックすると表示が切り替わります）' : 'すべての明細が消込済みです 🎉'}</td></tr>`;
     } else {
-      $('#tbl').innerHTML = head + view.map(rowHtml).join('');
+      $('#tbl').innerHTML = head + view.slice(0, state.limit).map(rowHtml).join('') + moreRow(view.length);
     }
     renderRef();
+  }
+
+  // 表示しきれない行は「さらに表示」で少しずつ出す（数千行を一度に描くと画面が重くなる）
+  function moreRow(n) {
+    if (n <= state.limit) return '';
+    return `<tr><td colspan="14" class="empty"><button class="more-rows">さらに ${Math.min(PAGE, n - state.limit)} 行を表示（残り ${n - state.limit} 行）</button></td></tr>`;
   }
 
   function rowHtml(r) {
@@ -515,16 +569,13 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
   }
 
   // 請求のない仕入行に、近い請求明細を候補として付ける
+  // 請求のない仕入行の候補（照合のときに計算済みの「近い請求行」上位3件）
   function invoiceCands(p) {
-    const list = [];
-    for (const r of state.rows) {
-      const v = r.v[0];
-      if (!v || !v.amount) continue;
-      const s = Matcher.scorePair(p, v, OPT);
-      const pct = Matcher.matchPercent(s);
-      if (pct >= 40) list.push({ r, pct });
+    if (!state.vRow) {
+      state.vRow = new Map();
+      for (const r of state.rows) for (const v of r.v) state.vRow.set(v, r);
     }
-    return list.sort((a, b) => b.pct - a.pct).slice(0, 3);
+    return (p._cands || []).map((c) => ({ r: state.vRow.get(c.v), pct: c.pct })).filter((c) => c.r);
   }
 
   function renderPur() {
@@ -562,7 +613,7 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
       $('#tbl').innerHTML = head + `<tr><td colspan="14" class="empty">該当する行はありません（上のマークをクリックすると表示が切り替わります）</td></tr>`;
       return;
     }
-    $('#tbl').innerHTML = head + view.map(purRowHtml).join('');
+    $('#tbl').innerHTML = head + view.slice(0, state.limit).map(purRowHtml).join('') + moreRow(view.length);
   }
 
   function purRowHtml(x) {
@@ -627,22 +678,25 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
     const m = b.dataset.mark;
     const set = state.view === 'pur' ? state.pmarks : state.marks;
     set.has(m) ? set.delete(m) : set.add(m);
+    state.limit = PAGE;
     render();
   });
   $('#viewSw').addEventListener('click', (e) => {
     const b = e.target.closest('[data-view]');
     if (!b) return;
     state.view = b.dataset.view;
+    state.limit = PAGE;
     render();
   });
   $('#doneSeg').addEventListener('click', (e) => {
     const b = e.target.closest('[data-done]');
     if (!b) return;
     state.done = b.dataset.done;
+    state.limit = PAGE;
     document.querySelectorAll('#doneSeg button').forEach((x) => x.classList.toggle('on', x === b));
     render();
   });
-  $('#q').addEventListener('input', (e) => { state.q = e.target.value; render(); });
+  $('#q').addEventListener('input', (e) => { state.q = e.target.value; state.limit = PAGE; render(); });
   $('#showCands').addEventListener('change', (e) => { state.showCands = e.target.checked; render(); });
   $('#bulk2').addEventListener('click', () => {
     if (state.view === 'pur') {
@@ -679,6 +733,7 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
     if (e.target.classList.contains('memo')) { r.memo = e.target.value; save(); }
   });
   $('#tbl').addEventListener('click', (e) => {
+    if (e.target.classList.contains('more-rows')) { state.limit += PAGE; render(); return; }
     const x = purOf(e.target);
     if (x) {
       if (e.target.classList.contains('vpick')) {
