@@ -1,0 +1,421 @@
+/*
+ * 請求書 × 仕入データ 照合ロジック
+ *
+ * ブラウザ（index.html）と Node（テスト・CLI）の両方から使う。
+ * 入力は「行の配列」に正規化済みのデータ。Excel の読み込みは readers 側で行う。
+ */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory();
+  else root.Matcher = factory();
+})(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
+
+  // ---------------------------------------------------------------- 文字列正規化
+
+  // 全角/半角・大小文字をそろえ、区切り記号を除く
+  function norm(s) {
+    return String(s == null ? '' : s)
+      .normalize('NFKC')
+      .toUpperCase()
+      .replace(/[\s\-‐‑–—−ｰ_\/・.,，、。()（）\[\]［］「」*＊＃#'"]/g, '');
+  }
+
+  // OCR や手入力で起きやすい揺れを吸収した「ゆるい」正規化
+  //   I/L/| → 1, O → 0, 濁点・半濁点を除去（バイブ/パイプ）, 小書きカナ → 大きいカナ, 長音を除去
+  const SMALL = { 'ァ': 'ア', 'ィ': 'イ', 'ゥ': 'ウ', 'ェ': 'エ', 'ォ': 'オ', 'ッ': 'ツ', 'ャ': 'ヤ', 'ュ': 'ユ', 'ョ': 'ヨ', 'ヮ': 'ワ' };
+  // 同じ意味の語をそろえる（送料・運賃など）
+  const SYNONYMS = [
+    [/ソウリヨウ|ウンチン|運賃|配送料|運送料/g, '送料'],
+  ];
+  function loose(s) {
+    let t = norm(s)
+      .normalize('NFD').replace(/[゙゚]/g, '').normalize('NFC')
+      .replace(/[ァィゥェォッャュョヮ]/g, (c) => SMALL[c])
+      .replace(/ー/g, '')
+      .replace(/[IL|]/g, '1')
+      .replace(/O/g, '0');
+    for (const [re, to] of SYNONYMS) t = t.replace(re, to);
+    return t;
+  }
+
+  function bigrams(s) {
+    const out = [];
+    if (s.length === 1) out.push(s);
+    for (let i = 0; i < s.length - 1; i++) out.push(s.slice(i, i + 2));
+    return out;
+  }
+
+  // a の bigram がどれだけ b に含まれているか（0〜1）。a が短い品番、b が長い品名文字列を想定
+  function containment(a, b) {
+    if (!a || !b) return 0;
+    if (b.includes(a)) return 1;
+    const bg = bigrams(a);
+    const pool = new Map();
+    for (const g of bigrams(b)) pool.set(g, (pool.get(g) || 0) + 1);
+    let hit = 0;
+    for (const g of bg) {
+      const n = pool.get(g);
+      if (n) { hit++; pool.set(g, n - 1); }
+    }
+    return hit / bg.length;
+  }
+
+  // a の中で b に連続して現れる最長部分の長さ / a の長さ
+  function longestRun(a, b) {
+    if (!a || !b) return 0;
+    let best = 0;
+    for (let i = 0; i < a.length; i++) {
+      for (let j = i + best + 1; j <= a.length; j++) {
+        if (b.includes(a.slice(i, j))) best = j - i; else break;
+      }
+    }
+    return best / a.length;
+  }
+
+  // 品番の類似度：完全包含なら 1、そうでなければ部分一致の度合い
+  function codeSimilarity(code, text) {
+    const c1 = norm(code), t1 = norm(text);
+    if (!c1) return 0;
+    // 1〜2文字の品番は、品名の中で独立した語として出てくる場合だけ一致とみなす
+    if (loose(code).length <= 2) {
+      const tokens = String(text || '').normalize('NFKC').toUpperCase().split(/[\s　]+/).map(loose);
+      return tokens.includes(loose(code)) ? 0.9 : 0;
+    }
+    if (t1.includes(c1)) return 1;
+    const c2 = loose(code), t2 = loose(text);
+    if (t2.includes(c2)) return 0.95;
+    const s = 0.5 * containment(c2, t2) + 0.5 * longestRun(c2, t2);
+    // 短い品番（3文字以下）は偶然一致しやすいので割り引く
+    return c2.length <= 3 ? s * 0.6 : s;
+  }
+
+  function nameSimilarity(name, text) {
+    const n = loose(name);
+    if (n.length < 2) return 0;
+    return containment(n, loose(text));
+  }
+
+  // ---------------------------------------------------------------- 発注番号
+
+  // 備考欄などから発注番号らしきもの（英字1〜2 + 数字4〜8）を取り出す
+  function extractPo(s) {
+    const t = String(s == null ? '' : s).normalize('NFKC').toUpperCase();
+    const m = t.match(/[A-Z]{1,2}\d{4,8}[A-Z]?/);
+    if (m) return m[0];
+    const d = t.match(/\d{4,8}/);
+    return d ? d[0] : '';
+  }
+  function poSimilarity(a, b) {
+    a = extractPo(a); b = extractPo(b);
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    const da = a.replace(/\D/g, ''), db = b.replace(/\D/g, '');
+    if (da && db && (da === db || da.endsWith(db) || db.endsWith(da))) return 0.7;
+    return 0;
+  }
+
+  // ---------------------------------------------------------------- 数値・日付
+
+  function num(v) {
+    if (v == null || v === '') return null;
+    if (typeof v === 'number') return v;
+    const n = Number(String(v).normalize('NFKC').replace(/[,，\s円¥]/g, ''));
+    return Number.isFinite(n) ? n : null;
+  }
+  function eq(a, b, tol) {
+    if (a == null || b == null) return false;
+    return Math.abs(a - b) <= (tol == null ? 0.005 : tol);
+  }
+
+  // 日付を「年初からの通算日」に変換（Date / Excel シリアル値 / "10/01" / "2026/10/01" に対応）
+  function dayIndex(v, fallbackYear) {
+    if (v == null || v === '') return null;
+    let d;
+    if (v instanceof Date) d = v;
+    else if (typeof v === 'number') d = new Date(Math.round((v - 25569) * 86400000));
+    else {
+      const t = String(v).normalize('NFKC').trim();
+      let m = t.match(/^(\d{4})[\/\-.年](\d{1,2})[\/\-.月](\d{1,2})/);
+      if (m) d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+      else if ((m = t.match(/^(\d{1,2})[\/\-.月](\d{1,2})/))) d = new Date(Date.UTC(fallbackYear || 2000, +m[1] - 1, +m[2]));
+      else return null;
+    }
+    return Math.round(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) / 86400000);
+  }
+
+  // ---------------------------------------------------------------- 照合本体
+
+  const DEFAULTS = {
+    acceptScore: 45,   // これ未満のペアは「対応なし」とみなす
+    minIdentity: 0.45, // 品番・品名の一致度がこれ未満なら、数値が合っていても採用しない
+    priceTol: 0.005,   // 単価の許容誤差（円）
+    amountTol: 1,      // 金額の許容誤差（円）
+  };
+
+  // 1 組（仕入 p × 請求 v）の採点
+  function scorePair(p, v, opt) {
+    const code = codeSimilarity(p.code, v.text);
+    const name = nameSimilarity(p.name, v.text);
+    // 品名だけ（メーカー名だけ等）で一致しているペアは弱く扱う
+    const identity = norm(p.code) ? Math.max(code, 0.6 * code + 0.4 * name) : 0.8 * name;
+    const po = poSimilarity(p.po, v.po);
+    const qty = eq(p.qty, v.qty, 0.0001);
+    const price = eq(p.price, v.price, opt.priceTol);
+    const amount = eq(p.amount, v.amount, opt.amountTol);
+    let date = 0;
+    if (p.day != null && v.day != null) {
+      const dd = Math.abs(p.day - v.day);
+      date = dd === 0 ? 1 : dd <= 3 ? 0.6 : dd <= 10 ? 0.3 : 0;
+    }
+    let slip = 0;
+    if (p.slip != null && v.slip != null && p.slip !== '' && v.slip !== '') {
+      const a = Number(p.slip), b = Number(v.slip);
+      if (String(p.slip) === String(v.slip)) slip = 1;
+      else if (Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) <= 2) slip = 0.5;
+    }
+    // 符号（返品）が逆なら別物
+    const signOk = (p.qty == null || v.qty == null) || Math.sign(p.qty) === Math.sign(v.qty) || p.qty === 0 || v.qty === 0;
+
+    let score =
+      45 * identity +
+      15 * po +
+      8 * (qty ? 1 : 0) +
+      8 * (price ? 1 : 0) +
+      8 * (amount ? 1 : 0) +
+      8 * date +
+      8 * slip;
+    if (!signOk) score -= 40;
+    return { score, identity, code, name, po, qty, price, amount, date, slip };
+  }
+
+  function judge(p, v, opt) {
+    const qtyOk = eq(p.qty, v.qty, 0.0001);
+    const priceOk = eq(p.price, v.price, opt.priceTol);
+    const amountOk = eq(p.amount, v.amount, opt.amountTol);
+    const issues = [];
+    // 数量・単価は違うが金額は一致 → 単位の違い（巻⇔m、箱⇔個 など）の可能性が高い
+    if (amountOk && !qtyOk && !priceOk) {
+      return { status: '単位違い（金額一致）', ok: true, warn: true, qtyDiff: (v.qty ?? 0) - (p.qty ?? 0), priceDiff: (v.price ?? 0) - (p.price ?? 0), amountDiff: (v.amount ?? 0) - (p.amount ?? 0) };
+    }
+    if (!qtyOk) issues.push('数量');
+    if (!priceOk) issues.push('単価');
+    if (!amountOk && qtyOk && priceOk) issues.push('金額');
+    return {
+      status: issues.length ? issues.join('・') + '差異' : '一致',
+      ok: issues.length === 0,
+      qtyDiff: (v.qty ?? 0) - (p.qty ?? 0),
+      priceDiff: (v.price ?? 0) - (p.price ?? 0),
+      amountDiff: (v.amount ?? 0) - (p.amount ?? 0),
+    };
+  }
+
+  function confidenceLabel(s) {
+    if (s.numericOnly) return '中';
+    if (s.identity >= 0.9 && (s.qty || s.price)) return '高';
+    if (s.identity >= 0.65) return '中';
+    return '低';
+  }
+
+  // 仕入行(複数可) × 請求行(複数可) から結果行を作る。手動で消込したときにも使う
+  function buildPairRow(ps, vs, s, options) {
+    const opt = Object.assign({}, DEFAULTS, options || {});
+    const sum = (arr, k) => arr.reduce((a, r) => a + (r[k] || 0), 0);
+    const p = { qty: sum(ps, 'qty'), amount: sum(ps, 'amount'), price: ps[0].price };
+    const v = { qty: sum(vs, 'qty'), amount: sum(vs, 'amount'), price: vs[0].price };
+    const j = judge(p, v, opt);
+    const split = ps.length > 1 || vs.length > 1;
+    return {
+      kind: 'pair',
+      status: j.status,
+      ok: j.ok,
+      warn: !!j.warn,
+      confidence: s ? confidenceLabel(s) : '手動',
+      note: [split ? `分割計上（仕入${ps.length}行／請求${vs.length}行）` : '', s && s.numericOnly ? '品番表記が異なる（伝票・金額で照合）' : ''].filter(Boolean).join('／'),
+      p: ps, v: vs,
+      qtyDiff: j.qtyDiff, priceDiff: j.priceDiff, amountDiff: j.amountDiff,
+      score: s ? Math.round(s.score) : null,
+    };
+  }
+
+  /**
+   * @param {Array} purchases  [{id, date, slip, maker, code, name, qty, price, amount, po}]
+   * @param {Array} invoices   [{id, date, slip, text, qty, price, amount, tax, po}]
+   */
+  function match(purchases, invoices, options) {
+    const opt = Object.assign({}, DEFAULTS, options || {});
+    const year = opt.year || new Date().getFullYear();
+    const P = purchases.map((r, i) => Object.assign({ _i: i }, r, { day: dayIndex(r.date, year) }));
+    const V = invoices.map((r, i) => Object.assign({ _i: i }, r, { day: dayIndex(r.date, year) }));
+
+    // 調整行（消費税調整・数量0）は照合の対象外
+    const isAdjust = (v) => /消費[税稅]調整|端数調整/.test(String(v.text || '')) || (!v.qty && !v.amount);
+
+    // 全ペアを採点して、点の高い順に 1 対 1 で確定（貪欲法）
+    const cand = [];
+    for (const p of P) {
+      for (const v of V) {
+        if (isAdjust(v)) continue;
+        const s = scorePair(p, v, opt);
+        // 品番の表記が全く違っても（社内コード等）、伝票番号か発注番号が合い、金額と数量/単価が一致すれば同じ明細とみなす
+        const numericMatch = p.amount && s.amount && (((s.qty || s.price) && (s.slip === 1 || s.po >= 0.7)) || (s.slip === 1 && s.po >= 0.7));
+        if ((s.score >= opt.acceptScore && s.identity >= opt.minIdentity) || numericMatch) {
+          s.numericOnly = s.identity < opt.minIdentity;
+          cand.push({ p, v, s });
+        }
+      }
+    }
+    cand.sort((a, b) => b.s.score - a.s.score);
+    const usedP = new Set(), usedV = new Set();
+    const pairs = [];
+    for (const c of cand) {
+      if (usedP.has(c.p._i) || usedV.has(c.v._i)) continue;
+      usedP.add(c.p._i); usedV.add(c.v._i);
+      pairs.push({ ps: [c.p], vs: [c.v], s: c.s });
+    }
+
+    // 2 段目a：1対1で数量が合わなかったペアに、同じ品番・発注番号の残り仕入行を足すと数量が合うなら取り込む
+    for (const pr of pairs) {
+      const v = pr.vs[0], p0 = pr.ps[0];
+      if (eq(p0.qty, v.qty, 0.0001)) continue;
+      const rest = P.filter((p) => !usedP.has(p._i) && norm(p.code) === norm(p0.code) && extractPo(p.po) === extractPo(p0.po));
+      if (!rest.length) continue;
+      // 小さい組合せから順に試す（行数は少ないので全探索）
+      let found = null;
+      for (let mask = 1; mask < 1 << Math.min(rest.length, 10) && !found; mask++) {
+        const pick = rest.filter((_, i) => mask & (1 << i));
+        const q = p0.qty + pick.reduce((a, p) => a + (p.qty || 0), 0);
+        if (eq(q, v.qty, 0.0001)) found = pick;
+      }
+      if (found) { found.forEach((p) => usedP.add(p._i)); pr.ps.push(...found); }
+    }
+
+    // 2 段目b：分割計上（仕入 2 行 → 請求 1 行、またはその逆）を拾う
+    const freeP = P.filter((p) => !usedP.has(p._i));
+    const freeV = V.filter((v) => !usedV.has(v._i) && !isAdjust(v));
+    const groupKey = (p) => norm(p.code) + '|' + extractPo(p.po);
+    const groups = new Map();
+    for (const p of freeP) {
+      const k = groupKey(p);
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(p);
+    }
+    for (const g of groups.values()) {
+      if (g.length < 2) continue;
+      const sumQty = g.reduce((a, p) => a + (p.qty || 0), 0);
+      const sumAmt = g.reduce((a, p) => a + (p.amount || 0), 0);
+      let best = null;
+      for (const v of freeV) {
+        if (usedV.has(v._i)) continue;
+        const s = scorePair(Object.assign({}, g[0], { qty: sumQty, amount: sumAmt }), v, opt);
+        if (s.identity >= 0.65 && (s.qty || s.amount) && (!best || s.score > best.s.score)) best = { v, s };
+      }
+      if (best) {
+        g.forEach((p) => usedP.add(p._i));
+        usedV.add(best.v._i);
+        pairs.push({ ps: g, vs: [best.v], s: best.s });
+      }
+    }
+    // 請求側の分割（請求 2 行 → 仕入 1 行）
+    for (const p of P.filter((x) => !usedP.has(x._i))) {
+      const vs = V.filter((v) => !usedV.has(v._i) && !isAdjust(v) && codeSimilarity(p.code, v.text) >= 0.9);
+      if (vs.length < 2) continue;
+      const q = vs.reduce((a, v) => a + (v.qty || 0), 0);
+      const amt = vs.reduce((a, v) => a + (v.amount || 0), 0);
+      if (eq(q, p.qty, 0.0001) || eq(amt, p.amount, opt.amountTol)) {
+        vs.forEach((v) => usedV.add(v._i));
+        usedP.add(p._i);
+        pairs.push({ ps: [p], vs, s: scorePair(p, Object.assign({}, vs[0], { qty: q, amount: amt }), opt) });
+      }
+    }
+
+    // ---------------------------------------------------------------- 結果行を組み立てる
+    const rows = [];
+    for (const pr of pairs) rows.push(buildPairRow(pr.ps, pr.vs, pr.s, opt));
+    // 請求のみの行のうち、同じ品名で金額が打ち消し合うもの（請求→取消）は相殺として扱う
+    const cancelled = new Set();
+    const restV = V.filter((v) => !usedV.has(v._i) && !isAdjust(v));
+    for (const a of restV) {
+      if (cancelled.has(a._i) || !(a.amount > 0)) continue;
+      const b = restV.find((x) => !cancelled.has(x._i) && x._i !== a._i && eq(x.amount, -a.amount, 0.5) && loose(x.text) === loose(a.text));
+      if (b) { cancelled.add(a._i); cancelled.add(b._i); }
+    }
+    for (const v of V) {
+      if (usedV.has(v._i)) continue;
+      if (cancelled.has(v._i)) {
+        rows.push({ kind: 'invoiceOnly', status: '取消（相殺済）', ok: true, confidence: '', note: '請求書内で同額の取消行と相殺', p: [], v: [v], qtyDiff: null, priceDiff: null, amountDiff: v.amount || 0, score: null });
+        continue;
+      }
+      if (!isAdjust(v) && !v.amount) {
+        rows.push({ kind: 'invoiceOnly', status: '0円明細', ok: true, confidence: '', note: '金額0円（無償・セット品など）', p: [], v: [v], qtyDiff: null, priceDiff: null, amountDiff: 0, score: null });
+        continue;
+      }
+      rows.push({
+        kind: 'invoiceOnly',
+        status: isAdjust(v) ? '調整行' : '請求のみ',
+        ok: isAdjust(v),
+        confidence: '', note: isAdjust(v) ? '' : '仕入データに該当なし：未計上・二重請求・取消の可能性',
+        p: [], v: [v], qtyDiff: null, priceDiff: null, amountDiff: v.amount || 0, score: null,
+      });
+    }
+    const cancelledP = new Set();
+    const restP = P.filter((p) => !usedP.has(p._i));
+    for (const a of restP) {
+      if (cancelledP.has(a._i) || !(a.amount > 0)) continue;
+      const b = restP.find((x) => !cancelledP.has(x._i) && x._i !== a._i && eq(x.amount, -a.amount, 0.5) && norm(x.code) === norm(a.code));
+      if (b) { cancelledP.add(a._i); cancelledP.add(b._i); }
+    }
+    for (const p of P) {
+      if (usedP.has(p._i)) continue;
+      if (cancelledP.has(p._i)) {
+        rows.push({ kind: 'purchaseOnly', status: '取消（相殺済）', ok: true, confidence: '', note: '仕入データ内で同額の赤伝と相殺', p: [p], v: [], qtyDiff: null, priceDiff: null, amountDiff: -(p.amount || 0), score: null });
+        continue;
+      }
+      rows.push({
+        kind: 'purchaseOnly', status: '仕入のみ', ok: false, confidence: '',
+        note: '請求書に該当なし：翌月請求・請求漏れ・社内伝票の可能性',
+        p: [p], v: [], qtyDiff: null, priceDiff: null, amountDiff: -(p.amount || 0), score: null,
+      });
+    }
+
+    // 対応なしの行には「もしかしてこれ」の候補を付ける（相手側の対応なし行から最も近いもの）
+    const openP = rows.filter((r) => r.status === '仕入のみ').map((r) => r.p[0]);
+    const openV = rows.filter((r) => r.status === '請求のみ').map((r) => r.v[0]);
+    for (const r of rows) {
+      if (r.status === '請求のみ') {
+        const v = r.v[0];
+        let best = null;
+        for (const p of openP) { const s = scorePair(p, v, opt); if (!best || s.score > best.s.score) best = { p, s }; }
+        if (best && best.s.score >= 25) r.suggest = { side: 'p', row: best.p, score: Math.round(best.s.score) };
+      } else if (r.status === '仕入のみ') {
+        const p = r.p[0];
+        let best = null;
+        for (const v of openV) { const s = scorePair(p, v, opt); if (!best || s.score > best.s.score) best = { v, s }; }
+        if (best && best.s.score >= 25) r.suggest = { side: 'v', row: best.v, score: Math.round(best.s.score) };
+      }
+    }
+
+    // 並び順：請求書の順（請求のない行は仕入の日付順で最後）
+    rows.sort((a, b) => {
+      const ka = a.v.length ? [0, a.v[0]._i] : [1, a.p[0].day ?? 0, a.p[0]._i];
+      const kb = b.v.length ? [0, b.v[0]._i] : [1, b.p[0].day ?? 0, b.p[0]._i];
+      for (let i = 0; i < 3; i++) if ((ka[i] ?? 0) !== (kb[i] ?? 0)) return (ka[i] ?? 0) - (kb[i] ?? 0);
+      return 0;
+    });
+
+    const total = (arr, k) => arr.reduce((a, r) => a + (num(r[k]) || 0), 0);
+    const summary = {
+      purchaseCount: P.length,
+      invoiceCount: V.length,
+      purchaseTotal: total(P, 'amount'),
+      invoiceTotal: total(V, 'amount'),
+      matched: rows.filter((r) => r.kind === 'pair' && r.ok).length,
+      mismatched: rows.filter((r) => r.kind === 'pair' && !r.ok).length,
+      warned: rows.filter((r) => r.warn).length,
+      invoiceOnly: rows.filter((r) => r.status === '請求のみ').length,
+      purchaseOnly: rows.filter((r) => r.status === '仕入のみ').length,
+    };
+    return { rows, summary };
+  }
+
+  return { match, buildPairRow, norm, loose, codeSimilarity, nameSimilarity, extractPo, num, dayIndex, scorePair };
+});

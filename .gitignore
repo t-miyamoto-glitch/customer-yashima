@@ -1,0 +1,6 @@
+# 顧客の請求書・仕入データは絶対にコミットしない
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+node_modules/
