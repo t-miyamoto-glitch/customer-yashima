@@ -216,6 +216,37 @@
     return '低';
   }
 
+  // 一致率（%）：品物の一致度 50% ＋ 発注番号/伝票番号 15% ＋ 数量・単価・金額 35%
+  // 日付は期ズレがあるので含めない
+  function matchPercent(s) {
+    if (!s) return null;
+    const numFrac = ((s.qty ? 1 : 0) + (s.price ? 1 : 0) + (s.amount ? 1 : 0)) / 3;
+    return Math.round(100 * (0.5 * s.identity + 0.15 * Math.max(s.po, s.slip) + 0.35 * numFrac));
+  }
+
+  // 判定マーク
+  //   ◎ 自動消込：品番がほぼそのまま見つかり、数量・単価・金額も一致（確認不要）
+  //   ○ ほぼ確実：数値は一致するが品番の書き方が違う／単位違い／0円（さっと目視）
+  //   △ 要確認　：相手は見つかったが数値が違う、または有力な候補がある
+  //   × 該当なし：近い仕入行が見つからない（手で探す）
+  const MARKS = ['◎', '○', '△', '×'];
+  function rateRow(r) {
+    if (r.kind === 'pair') {
+      if (!r.ok) return { mark: '△', reason: r.status };
+      if (r.warn) return { mark: '○', reason: '単位違い（金額は一致）' };
+      if (r.confidence === '高') return { mark: '◎', reason: '品番・数量・単価・金額が一致' };
+      if (r.confidence === '手動') return { mark: '○', reason: '手動で消込' };
+      return { mark: '○', reason: '数値は一致／品番の書き方が違う' };
+    }
+    if (r.status.startsWith('取消') || r.status === '調整行') return { mark: '◎', reason: r.status };
+    if (r.status === '0円明細') return { mark: '○', reason: '0円明細' };
+    const best = r.cands && r.cands[0];
+    if (best && best.pct >= 50) {
+      return { mark: '△', reason: best.usedBy ? '候補は別の請求行で消込済み（二重請求？）' : '候補あり（自動では決めきれず）' };
+    }
+    return { mark: '×', reason: '近い仕入行なし' };
+  }
+
   // 仕入行(複数可) × 請求行(複数可) から結果行を作る。手動で消込したときにも使う
   function buildPairRow(ps, vs, s, options) {
     const opt = Object.assign({}, DEFAULTS, options || {});
@@ -234,6 +265,8 @@
       p: ps, v: vs,
       qtyDiff: j.qtyDiff, priceDiff: j.priceDiff, amountDiff: j.amountDiff,
       score: s ? Math.round(s.score) : null,
+      pct: s ? matchPercent(s) : null,
+      identity: s ? s.identity : null,
     };
   }
 
@@ -252,10 +285,17 @@
 
     // 全ペアを採点して、点の高い順に 1 対 1 で確定（貪欲法）
     const cand = [];
+    const topByV = new Map(); // 請求行ごとの「近い仕入行」上位（候補表示用）
     for (const p of P) {
       for (const v of V) {
         if (isAdjust(v)) continue;
         const s = scorePair(p, v, opt);
+        if (s.score >= 25) {
+          let t = topByV.get(v._i);
+          if (!t) topByV.set(v._i, (t = []));
+          t.push({ p, s });
+          if (t.length > 12) { t.sort((a, b) => b.s.score - a.s.score); t.length = 6; }
+        }
         // 品番の表記が全く違っても（社内コード等）、伝票番号か発注番号が合い、金額と数量/単価が一致すれば同じ明細とみなす
         const numericMatch = p.amount && s.amount && (((s.qty || s.price) && (s.slip === 1 || s.po >= 0.7)) || (s.slip === 1 && s.po >= 0.7));
         if ((s.score >= opt.acceptScore && s.identity >= opt.minIdentity) || numericMatch) {
@@ -377,22 +417,23 @@
       });
     }
 
-    // 対応なしの行には「もしかしてこれ」の候補を付ける（相手側の対応なし行から最も近いもの）
-    const openP = rows.filter((r) => r.status === '仕入のみ').map((r) => r.p[0]);
-    const openV = rows.filter((r) => r.status === '請求のみ').map((r) => r.v[0]);
+    // 請求行ごとに候補（近い仕入行の上位3件）と判定マークを付ける
+    const ownerOfP = new Map();
+    for (const r of rows) if (r.kind === 'pair') for (const p of r.p) ownerOfP.set(p._i, r);
     for (const r of rows) {
-      if (r.status === '請求のみ') {
-        const v = r.v[0];
-        let best = null;
-        for (const p of openP) { const s = scorePair(p, v, opt); if (!best || s.score > best.s.score) best = { p, s }; }
-        if (best && best.s.score >= 25) r.suggest = { side: 'p', row: best.p, score: Math.round(best.s.score) };
-      } else if (r.status === '仕入のみ') {
-        const p = r.p[0];
-        let best = null;
-        for (const v of openV) { const s = scorePair(p, v, opt); if (!best || s.score > best.s.score) best = { v, s }; }
-        if (best && best.s.score >= 25) r.suggest = { side: 'v', row: best.v, score: Math.round(best.s.score) };
-      }
+      if (!r.v.length) continue;
+      const mine = new Set(r.p.map((p) => p._i));
+      const list = (topByV.get(r.v[0]._i) || [])
+        .filter((c) => !mine.has(c.p._i))
+        .sort((x, y) => y.s.score - x.s.score)
+        .map((c) => ({ p: c.p, pct: matchPercent(c.s), usedBy: ownerOfP.has(c.p._i) ? ownerOfP.get(c.p._i).v.map((v) => v.id) : null }))
+        .filter((c) => c.pct >= 40) // 一致率 40% 未満は候補として出さない（ノイズになるため）
+        .slice(0, 3);
+      r.cands = list;
+      Object.assign(r, rateRow(r));
+      if (r.kind !== 'pair') r.pct = r.mark === '△' || r.mark === '×' ? (list[0] ? list[0].pct : 0) : null;
     }
+    for (const r of rows) if (!r.v.length) { r.mark = ''; r.reason = r.status; }
 
     // 並び順：請求書の順（請求のない行は仕入の日付順で最後）
     rows.sort((a, b) => {
@@ -413,9 +454,10 @@
       warned: rows.filter((r) => r.warn).length,
       invoiceOnly: rows.filter((r) => r.status === '請求のみ').length,
       purchaseOnly: rows.filter((r) => r.status === '仕入のみ').length,
+      marks: Object.fromEntries(MARKS.map((m) => [m, rows.filter((r) => r.mark === m).length])),
     };
     return { rows, summary };
   }
 
-  return { match, buildPairRow, norm, loose, codeSimilarity, nameSimilarity, extractPo, num, dayIndex, scorePair };
+  return { match, buildPairRow, rateRow, matchPercent, MARKS, norm, loose, codeSimilarity, nameSimilarity, extractPo, num, dayIndex, scorePair };
 });
