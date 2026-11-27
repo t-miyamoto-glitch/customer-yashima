@@ -116,15 +116,15 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
   <section class="drops">
     <label class="drop" id="dropInv">
       <h2>① 請求書（請求明細）</h2>
-      <div class="hint">Excel（.xlsx / .xls / .csv）をドロップ、またはクリックして選択</div>
+      <div class="hint">Excel / CSV をドロップ、またはクリックして選択（ヤシマ電材・山善・コイズミ形式に対応）</div>
       <div class="file"></div>
-      <input type="file" accept=".xlsx,.xls,.xlsm,.csv">
+      <input type="file" accept=".xlsx,.xls,.xlsm,.csv,.txt">
     </label>
     <label class="drop" id="dropPur">
       <h2>② 仕入データ（メタフォース出力）</h2>
       <div class="hint">前月・翌月分が混ざっていても構いません（期ズレ・繰越は気にしなくてOK）</div>
       <div class="file"></div>
-      <input type="file" accept=".xlsx,.xls,.xlsm,.csv">
+      <input type="file" accept=".xlsx,.xls,.xlsm,.csv,.txt">
     </label>
   </section>
   <div class="actions">
@@ -193,7 +193,7 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
       if (!file) return;
       $('#err').textContent = '';
       try {
-        const wb = XLSX.read(await file.arrayBuffer(), { type: 'array', cellDates: false });
+        const wb = Readers.readWorkbook(XLSX, await file.arrayBuffer(), file.name);
         state[key] = { name: file.name, wb };
         el.classList.add('done');
         el.querySelector('.file').textContent = '✓ ' + file.name;
@@ -212,7 +212,8 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
 
   function guessYear(rows) {
     for (const r of rows) {
-      if (typeof r.date === 'number') return new Date(Matcher.dayIndex(r.date) * 86400000).getUTCFullYear();
+      const d = Matcher.dayIndex(r.date);
+      if (d != null && (typeof r.date === 'number' || /\d{4}/.test(String(r.date)))) return new Date(d * 86400000).getUTCFullYear();
     }
     return new Date().getFullYear();
   }
@@ -404,7 +405,7 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
       html += `<tr class="${MCLS[r.mark]} ${r.checked ? 'done' : ''}" data-key="${k}">`;
       if (i === 0) html += `<td class="mark" rowspan="${n}">${r.mark}</td><td class="pct" rowspan="${n}">${pctCell(r.pct)}</td>`;
       html += v
-        ? `<td>${esc(fmtDate(v.date))}</td><td>${esc(v.slip)}</td><td class="txt">${esc(v.text)}${v.po ? `<div class="sub">備考：${esc(v.po)}</div>` : ''}</td>`
+        ? `<td>${esc(fmtDate(v.date))}</td><td>${esc(v.slip)}</td><td class="txt">${esc(v.text)}${v.po ? `<div class="sub">注番・備考：${esc(v.po)}</div>` : ''}</td>`
           + `<td class="n ${qtyBad ? 'bad' : ''}">${yen(v.qty)}</td><td class="n ${priceBad ? 'bad' : ''}">${yen(v.price)}</td><td class="n">${yen(v.amount)}</td>`
         : `<td colspan="6"></td>`;
       html += p
@@ -421,10 +422,12 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
       html += `</tr>`;
     }
     const wantCands = state.showCands && (r.mark === '△' || r.mark === '×' || r.showCands) && !r.checked;
-    if (r.cands && r.cands.length && wantCands) {
+    // 相手が決まっている行は、今の相手より一致率の高い候補だけを出す（ノイズを減らす）
+    const cands = (r.cands || []).map((c, ci) => ({ c, ci })).filter(({ c }) => r.kind !== 'pair' || r.showCands || c.pct >= (r.pct ?? 0));
+    if (cands.length && wantCands) {
       html += `<tr class="cands" data-key="${k}"><td colspan="14"><div class="cands-title">${r.kind === 'pair' ? '他の候補' : '候補（近い順）'}</div>`
-        + r.cands.map((c, ci) => candHtml(r, c, ci)).join('') + `</td></tr>`;
-    } else if (r.cands && r.cands.length && !r.checked && r.mark !== '◎') {
+        + cands.map(({ c, ci }) => candHtml(r, c, ci)).join('') + `</td></tr>`;
+    } else if (r.cands && r.cands.length && !r.checked && r.mark !== '◎' && !r.showCands) {
       html += `<tr class="cands" data-key="${k}"><td colspan="14" style="padding-top:0"><button class="small more">候補を見る（${r.cands.length}）</button></td></tr>`;
     }
     return html;

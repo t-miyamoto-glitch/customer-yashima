@@ -22,15 +22,20 @@
     amount: ['金額', '仕入金額'],
     po: ['発注№', '発注No', '発注NO', '発注番号', '工事番号'],
   };
+  // 仕入先ごとに見出しの名前が違うので、候補を並べておく（左ほど優先）
+  //   ヤシマ電材：月日・伝票番号・商品名・内容・数量・単価・金額・備考
+  //   山善（CSV）：出荷日・請求伝票番号・メーカー・商品名・形式・数量・税抜き単価・税抜き金額・得意先注番
+  //   コイズミ　：注番・品番・数量・単価・金額（日付・伝票番号・品名なし）
   const INVOICE_COLS = {
-    date: ['月日', '日付', '納品日'],
-    slip: ['伝票番号', '伝票№', '伝票No', '伝票NO'],
-    text: ['商品名・内容', '商品名', '品名', '品名・規格', '内容'],
+    date: ['月日', '日付', '納品日', '出荷日', '売上日', '伝票日付'],
+    slip: ['伝票番号', '請求伝票番号', '伝票№', '伝票No', '伝票NO', '納品書番号'],
+    text: ['商品名・内容', '商品名', 'メーカー・商品名', '品名', '品名・規格', '内容'],
+    code: ['形式', '品番', '型番', '商品コード'],
     qty: ['数量'],
-    price: ['単価'],
-    amount: ['金額'],
+    price: ['単価', '税抜き単価', '税抜単価', '納入単価'],
+    amount: ['金額', '税抜き金額', '税抜金額', '納入金額'],
     tax: ['消費税', '税額'],
-    po: ['備考', '摘要', '発注番号', '注文番号'],
+    po: ['得意先注番', '注番', '発注番号', '注文番号', '備考', '摘要'],
   };
 
   function findHeader(rows, spec) {
@@ -41,7 +46,8 @@
       for (const [key, names] of Object.entries(spec)) {
         const wanted = names.map(clean);
         // 完全一致を優先、なければ前方一致
-        let idx = cells.findIndex((c) => wanted.includes(c));
+        let idx = -1;
+        for (const w of wanted) { idx = cells.indexOf(w); if (idx >= 0) break; }
         if (idx < 0) idx = cells.findIndex((c) => c && wanted.some((w) => c.startsWith(w)));
         if (idx >= 0) map[key] = idx;
       }
@@ -94,7 +100,7 @@
         id: r.id, date: r.date, slip: r.slip, maker: str(r.maker), code: str(r.code), name: str(r.name),
         qty: toNum(r.qty), price: toNum(r.price), amount: toNum(r.amount), po: str(r.po),
       }))
-      .filter((r) => r.code || r.name || r.amount);
+      .filter((r) => (r.code || r.name || r.amount) && (r.qty != null || r.amount != null));
     return s;
   }
 
@@ -103,10 +109,13 @@
     if (!s) throw new Error('請求明細の見出し行（商品名・数量・単価・金額 など）が見つかりません');
     s.rows = s.rows
       .map((r) => ({
-        id: r.id, date: r.date, slip: r.slip, text: str(r.text),
+        id: r.id, date: r.date, slip: r.slip,
+        // 品名と品番が別の列なら、つなげて 1 つの「商品名」として扱う
+        text: [str(r.text), str(r.code)].filter(Boolean).join(' '),
         qty: toNum(r.qty), price: toNum(r.price), amount: toNum(r.amount), tax: toNum(r.tax), po: str(r.po),
       }))
-      .filter((r) => r.text || r.amount);
+      // 数量も金額もない行（山善 CSV の伝票見出し行など）は明細ではないので除く
+      .filter((r) => (r.text || r.amount != null) && (r.qty != null || r.amount != null));
     // 請求書鑑（当月お買上額）があれば拾う
     s.header = {};
     for (const name of wb.SheetNames) {
@@ -123,5 +132,16 @@
     return s;
   }
 
-  return { readPurchases, readInvoices };
+  // ファイル（ArrayBuffer）→ ワークブック。CSV は Shift-JIS / UTF-8 を自動判別し、値は文字列のまま読む
+  function readWorkbook(XLSX, buf, filename) {
+    const bytes = new Uint8Array(buf);
+    const isCsv = /\.(csv|txt|tsv)$/i.test(filename || '');
+    if (!isCsv) return XLSX.read(bytes, { type: 'array', cellDates: false });
+    let text;
+    try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch (e) { text = new TextDecoder('shift_jis').decode(bytes); }
+    text = text.replace(/^\uFEFF/, '');
+    return XLSX.read(text, { type: 'string', raw: true, FS: /\.tsv$/i.test(filename) ? '\t' : undefined });
+  }
+
+  return { readPurchases, readInvoices, readWorkbook };
 });

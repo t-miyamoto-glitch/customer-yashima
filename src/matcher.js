@@ -145,6 +145,8 @@
 
   // ---------------------------------------------------------------- 照合本体
 
+  const GENERIC = /^(送料|値引|値引キ|ネビキ|手数料|代引|割増|調整)$/;
+
   const DEFAULTS = {
     acceptScore: 45,   // これ未満のペアは「対応なし」とみなす
     minIdentity: 0.45, // 品番・品名の一致度がこれ未満なら、数値が合っていても採用しない
@@ -157,8 +159,10 @@
     const code = codeSimilarity(p.code, v.text);
     const name = nameSimilarity(p.name, v.text);
     // 品名だけ（メーカー名だけ等）で一致しているペアは弱く扱う
-    const identity = norm(p.code) ? Math.max(code, 0.6 * code + 0.4 * name) : 0.8 * name;
+    let identity = norm(p.code) ? Math.max(code, 0.6 * code + 0.4 * name) : 0.8 * name;
     const po = poSimilarity(p.po, v.po);
+    // 「送料」のような一般的な語は、発注番号か伝票番号が合わない限り同じ明細とはみなさない
+    if (GENERIC.test(loose(p.code)) && po < 0.7 && String(p.slip) !== String(v.slip)) identity *= 0.4;
     const qty = eq(p.qty, v.qty, 0.0001);
     const price = eq(p.price, v.price, opt.priceTol);
     const amount = eq(p.amount, v.amount, opt.amountTol);
@@ -233,17 +237,20 @@
   function rateRow(r) {
     if (r.kind === 'pair') {
       if (!r.ok) return { mark: '△', reason: r.status };
+      if (r.warn && /値引/.test(r.note)) return { mark: '○', reason: '値引き行と合算して一致' };
       if (r.warn) return { mark: '○', reason: '単位違い（金額は一致）' };
       if (r.confidence === '高') return { mark: '◎', reason: '品番・数量・単価・金額が一致' };
       if (r.confidence === '手動') return { mark: '○', reason: '手動で消込' };
       return { mark: '○', reason: '数値は一致／品番の書き方が違う' };
     }
     if (r.status.startsWith('取消') || r.status === '調整行') return { mark: '◎', reason: r.status };
-    if (r.status === '0円明細') return { mark: '○', reason: '0円明細' };
-    const best = r.cands && r.cands[0];
-    if (best && best.pct >= 50) {
-      return { mark: '△', reason: best.usedBy ? '候補は別の請求行で消込済み（二重請求？）' : '候補あり（自動では決めきれず）' };
-    }
+    // 0円明細（セット部材・無償品）は支払いに影響しないので確認不要
+    if (r.status === '0円明細') return { mark: '◎', reason: '0円明細（セット部材・無償品）' };
+    const cands = r.cands || [];
+    const free = cands.find((c) => !c.usedBy && c.pct >= 50);
+    if (free) return { mark: '△', reason: '候補あり（自動では決めきれず）' };
+    const used = cands.find((c) => c.usedBy && c.pct >= 50);
+    if (used) return { mark: '×', reason: '同じ品物の仕入は他の請求行で使用済み（仕入計上漏れ／二重請求？）' };
     return { mark: '×', reason: '近い仕入行なし' };
   }
 
@@ -268,6 +275,18 @@
       pct: s ? matchPercent(s) : null,
       identity: s ? s.identity : null,
     };
+  }
+
+  // 値引き行を含むペア：金額の合計で比べる
+  function buildRebateRow(pr, opt) {
+    const row = buildPairRow(pr.ps, pr.vs, pr.s, opt);
+    const net = pr.vs.reduce((a, v) => a + (v.amount || 0), 0);
+    const pAmt = pr.ps.reduce((a, p) => a + (p.amount || 0), 0);
+    if (eq(net, pAmt, opt.amountTol)) {
+      Object.assign(row, { status: '一致', ok: true, warn: true, amountDiff: net - pAmt, qtyDiff: 0, priceDiff: 0 });
+      row.note = '値引き・単価訂正の行と合算すると一致';
+    }
+    return row;
   }
 
   /**
@@ -368,9 +387,29 @@
       }
     }
 
+    // 3 段目：値引き・単価訂正の行（マイナス数量）を、同じ品番・発注番号のペアに合算する
+    //   例）請求 2個×31,920 ＋ 値引 −2個×1,680 ＝ 2個×30,240（仕入）
+    for (const pr of pairs) {
+      if (pr.ps.length !== 1) continue;
+      const p = pr.ps[0];
+      const base = pr.vs.reduce((a, v) => a + (v.amount || 0), 0);
+      if (eq(base, p.amount, opt.amountTol)) continue;
+      const adj = V.filter((v) => !usedV.has(v._i) && !isAdjust(v) && (v.qty || 0) < 0 && (v.amount || 0) < 0
+        && codeSimilarity(p.code, v.text) >= 0.9 && poSimilarity(p.po, v.po) >= 0.7);
+      const hit = adj.find((v) => eq(base + v.amount, p.amount, opt.amountTol));
+      if (hit) {
+        usedV.add(hit._i);
+        pr.vs.push(hit);
+        pr.rebate = true;
+      }
+    }
+
     // ---------------------------------------------------------------- 結果行を組み立てる
     const rows = [];
-    for (const pr of pairs) rows.push(buildPairRow(pr.ps, pr.vs, pr.s, opt));
+    for (const pr of pairs) {
+      const row = pr.rebate ? buildRebateRow(pr, opt) : buildPairRow(pr.ps, pr.vs, pr.s, opt);
+      rows.push(row);
+    }
     // 請求のみの行のうち、同じ品名で金額が打ち消し合うもの（請求→取消）は相殺として扱う
     const cancelled = new Set();
     const restV = V.filter((v) => !usedV.has(v._i) && !isAdjust(v));
@@ -423,7 +462,8 @@
     for (const r of rows) {
       if (!r.v.length) continue;
       const mine = new Set(r.p.map((p) => p._i));
-      const list = (topByV.get(r.v[0]._i) || [])
+      const zero = r.v.every((v) => !v.amount);
+      const list = (zero ? [] : topByV.get(r.v[0]._i) || [])
         .filter((c) => !mine.has(c.p._i))
         .sort((x, y) => y.s.score - x.s.score)
         .map((c) => ({ p: c.p, pct: matchPercent(c.s), usedBy: ownerOfP.has(c.p._i) ? ownerOfP.get(c.p._i).v.map((v) => v.id) : null }))
@@ -434,6 +474,25 @@
       if (r.kind !== 'pair') r.pct = r.mark === '△' || r.mark === '×' ? (list[0] ? list[0].pct : 0) : null;
     }
     for (const r of rows) if (!r.v.length) { r.mark = ''; r.reason = r.status; }
+
+    // 同じ発注番号の中で単価の振り分けが違うだけ（合計は一致）なら ○ に格上げ
+    //   例）本体 98,420＋配管 3,800（請求） ⇔ 本体 102,220＋配管 0（仕入）
+    const byPo = new Map();
+    for (const r of rows) {
+      if (r.kind !== 'pair' || r.mark !== '△') continue;
+      const k = extractPo(r.p[0].po) || extractPo(r.v[0].po);
+      if (!k) continue;
+      if (!byPo.has(k)) byPo.set(k, []);
+      byPo.get(k).push(r);
+    }
+    for (const g of byPo.values()) {
+      if (g.length < 2) continue;
+      const vs = g.reduce((a, r) => a + r.v.reduce((b, v) => b + (v.amount || 0), 0), 0);
+      const ps = g.reduce((a, r) => a + r.p.reduce((b, p) => b + (p.amount || 0), 0), 0);
+      if (eq(vs, ps, opt.amountTol)) {
+        for (const r of g) { r.mark = '○'; r.reason = '同じ発注内で合計は一致（単価の振り分け違い）'; }
+      }
+    }
 
     // 並び順：請求書の順（請求のない行は仕入の日付順で最後）
     rows.sort((a, b) => {

@@ -116,15 +116,15 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
   <section class="drops">
     <label class="drop" id="dropInv">
       <h2>① 請求書（請求明細）</h2>
-      <div class="hint">Excel（.xlsx / .xls / .csv）をドロップ、またはクリックして選択</div>
+      <div class="hint">Excel / CSV をドロップ、またはクリックして選択（ヤシマ電材・山善・コイズミ形式に対応）</div>
       <div class="file"></div>
-      <input type="file" accept=".xlsx,.xls,.xlsm,.csv">
+      <input type="file" accept=".xlsx,.xls,.xlsm,.csv,.txt">
     </label>
     <label class="drop" id="dropPur">
       <h2>② 仕入データ（メタフォース出力）</h2>
       <div class="hint">前月・翌月分が混ざっていても構いません（期ズレ・繰越は気にしなくてOK）</div>
       <div class="file"></div>
-      <input type="file" accept=".xlsx,.xls,.xlsm,.csv">
+      <input type="file" accept=".xlsx,.xls,.xlsm,.csv,.txt">
     </label>
   </section>
   <div class="actions">
@@ -318,6 +318,8 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
 
   // ---------------------------------------------------------------- 照合本体
 
+  const GENERIC = /^(送料|値引|値引キ|ネビキ|手数料|代引|割増|調整)$/;
+
   const DEFAULTS = {
     acceptScore: 45,   // これ未満のペアは「対応なし」とみなす
     minIdentity: 0.45, // 品番・品名の一致度がこれ未満なら、数値が合っていても採用しない
@@ -330,8 +332,10 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
     const code = codeSimilarity(p.code, v.text);
     const name = nameSimilarity(p.name, v.text);
     // 品名だけ（メーカー名だけ等）で一致しているペアは弱く扱う
-    const identity = norm(p.code) ? Math.max(code, 0.6 * code + 0.4 * name) : 0.8 * name;
+    let identity = norm(p.code) ? Math.max(code, 0.6 * code + 0.4 * name) : 0.8 * name;
     const po = poSimilarity(p.po, v.po);
+    // 「送料」のような一般的な語は、発注番号か伝票番号が合わない限り同じ明細とはみなさない
+    if (GENERIC.test(loose(p.code)) && po < 0.7 && String(p.slip) !== String(v.slip)) identity *= 0.4;
     const qty = eq(p.qty, v.qty, 0.0001);
     const price = eq(p.price, v.price, opt.priceTol);
     const amount = eq(p.amount, v.amount, opt.amountTol);
@@ -406,17 +410,20 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
   function rateRow(r) {
     if (r.kind === 'pair') {
       if (!r.ok) return { mark: '△', reason: r.status };
+      if (r.warn && /値引/.test(r.note)) return { mark: '○', reason: '値引き行と合算して一致' };
       if (r.warn) return { mark: '○', reason: '単位違い（金額は一致）' };
       if (r.confidence === '高') return { mark: '◎', reason: '品番・数量・単価・金額が一致' };
       if (r.confidence === '手動') return { mark: '○', reason: '手動で消込' };
       return { mark: '○', reason: '数値は一致／品番の書き方が違う' };
     }
     if (r.status.startsWith('取消') || r.status === '調整行') return { mark: '◎', reason: r.status };
-    if (r.status === '0円明細') return { mark: '○', reason: '0円明細' };
-    const best = r.cands && r.cands[0];
-    if (best && best.pct >= 50) {
-      return { mark: '△', reason: best.usedBy ? '候補は別の請求行で消込済み（二重請求？）' : '候補あり（自動では決めきれず）' };
-    }
+    // 0円明細（セット部材・無償品）は支払いに影響しないので確認不要
+    if (r.status === '0円明細') return { mark: '◎', reason: '0円明細（セット部材・無償品）' };
+    const cands = r.cands || [];
+    const free = cands.find((c) => !c.usedBy && c.pct >= 50);
+    if (free) return { mark: '△', reason: '候補あり（自動では決めきれず）' };
+    const used = cands.find((c) => c.usedBy && c.pct >= 50);
+    if (used) return { mark: '×', reason: '同じ品物の仕入は他の請求行で使用済み（仕入計上漏れ／二重請求？）' };
     return { mark: '×', reason: '近い仕入行なし' };
   }
 
@@ -441,6 +448,18 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
       pct: s ? matchPercent(s) : null,
       identity: s ? s.identity : null,
     };
+  }
+
+  // 値引き行を含むペア：金額の合計で比べる
+  function buildRebateRow(pr, opt) {
+    const row = buildPairRow(pr.ps, pr.vs, pr.s, opt);
+    const net = pr.vs.reduce((a, v) => a + (v.amount || 0), 0);
+    const pAmt = pr.ps.reduce((a, p) => a + (p.amount || 0), 0);
+    if (eq(net, pAmt, opt.amountTol)) {
+      Object.assign(row, { status: '一致', ok: true, warn: true, amountDiff: net - pAmt, qtyDiff: 0, priceDiff: 0 });
+      row.note = '値引き・単価訂正の行と合算すると一致';
+    }
+    return row;
   }
 
   /**
@@ -541,9 +560,29 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
       }
     }
 
+    // 3 段目：値引き・単価訂正の行（マイナス数量）を、同じ品番・発注番号のペアに合算する
+    //   例）請求 2個×31,920 ＋ 値引 −2個×1,680 ＝ 2個×30,240（仕入）
+    for (const pr of pairs) {
+      if (pr.ps.length !== 1) continue;
+      const p = pr.ps[0];
+      const base = pr.vs.reduce((a, v) => a + (v.amount || 0), 0);
+      if (eq(base, p.amount, opt.amountTol)) continue;
+      const adj = V.filter((v) => !usedV.has(v._i) && !isAdjust(v) && (v.qty || 0) < 0 && (v.amount || 0) < 0
+        && codeSimilarity(p.code, v.text) >= 0.9 && poSimilarity(p.po, v.po) >= 0.7);
+      const hit = adj.find((v) => eq(base + v.amount, p.amount, opt.amountTol));
+      if (hit) {
+        usedV.add(hit._i);
+        pr.vs.push(hit);
+        pr.rebate = true;
+      }
+    }
+
     // ---------------------------------------------------------------- 結果行を組み立てる
     const rows = [];
-    for (const pr of pairs) rows.push(buildPairRow(pr.ps, pr.vs, pr.s, opt));
+    for (const pr of pairs) {
+      const row = pr.rebate ? buildRebateRow(pr, opt) : buildPairRow(pr.ps, pr.vs, pr.s, opt);
+      rows.push(row);
+    }
     // 請求のみの行のうち、同じ品名で金額が打ち消し合うもの（請求→取消）は相殺として扱う
     const cancelled = new Set();
     const restV = V.filter((v) => !usedV.has(v._i) && !isAdjust(v));
@@ -596,7 +635,8 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
     for (const r of rows) {
       if (!r.v.length) continue;
       const mine = new Set(r.p.map((p) => p._i));
-      const list = (topByV.get(r.v[0]._i) || [])
+      const zero = r.v.every((v) => !v.amount);
+      const list = (zero ? [] : topByV.get(r.v[0]._i) || [])
         .filter((c) => !mine.has(c.p._i))
         .sort((x, y) => y.s.score - x.s.score)
         .map((c) => ({ p: c.p, pct: matchPercent(c.s), usedBy: ownerOfP.has(c.p._i) ? ownerOfP.get(c.p._i).v.map((v) => v.id) : null }))
@@ -607,6 +647,25 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
       if (r.kind !== 'pair') r.pct = r.mark === '△' || r.mark === '×' ? (list[0] ? list[0].pct : 0) : null;
     }
     for (const r of rows) if (!r.v.length) { r.mark = ''; r.reason = r.status; }
+
+    // 同じ発注番号の中で単価の振り分けが違うだけ（合計は一致）なら ○ に格上げ
+    //   例）本体 98,420＋配管 3,800（請求） ⇔ 本体 102,220＋配管 0（仕入）
+    const byPo = new Map();
+    for (const r of rows) {
+      if (r.kind !== 'pair' || r.mark !== '△') continue;
+      const k = extractPo(r.p[0].po) || extractPo(r.v[0].po);
+      if (!k) continue;
+      if (!byPo.has(k)) byPo.set(k, []);
+      byPo.get(k).push(r);
+    }
+    for (const g of byPo.values()) {
+      if (g.length < 2) continue;
+      const vs = g.reduce((a, r) => a + r.v.reduce((b, v) => b + (v.amount || 0), 0), 0);
+      const ps = g.reduce((a, r) => a + r.p.reduce((b, p) => b + (p.amount || 0), 0), 0);
+      if (eq(vs, ps, opt.amountTol)) {
+        for (const r of g) { r.mark = '○'; r.reason = '同じ発注内で合計は一致（単価の振り分け違い）'; }
+      }
+    }
 
     // 並び順：請求書の順（請求のない行は仕入の日付順で最後）
     rows.sort((a, b) => {
@@ -661,15 +720,20 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
     amount: ['金額', '仕入金額'],
     po: ['発注№', '発注No', '発注NO', '発注番号', '工事番号'],
   };
+  // 仕入先ごとに見出しの名前が違うので、候補を並べておく（左ほど優先）
+  //   ヤシマ電材：月日・伝票番号・商品名・内容・数量・単価・金額・備考
+  //   山善（CSV）：出荷日・請求伝票番号・メーカー・商品名・形式・数量・税抜き単価・税抜き金額・得意先注番
+  //   コイズミ　：注番・品番・数量・単価・金額（日付・伝票番号・品名なし）
   const INVOICE_COLS = {
-    date: ['月日', '日付', '納品日'],
-    slip: ['伝票番号', '伝票№', '伝票No', '伝票NO'],
-    text: ['商品名・内容', '商品名', '品名', '品名・規格', '内容'],
+    date: ['月日', '日付', '納品日', '出荷日', '売上日', '伝票日付'],
+    slip: ['伝票番号', '請求伝票番号', '伝票№', '伝票No', '伝票NO', '納品書番号'],
+    text: ['商品名・内容', '商品名', 'メーカー・商品名', '品名', '品名・規格', '内容'],
+    code: ['形式', '品番', '型番', '商品コード'],
     qty: ['数量'],
-    price: ['単価'],
-    amount: ['金額'],
+    price: ['単価', '税抜き単価', '税抜単価', '納入単価'],
+    amount: ['金額', '税抜き金額', '税抜金額', '納入金額'],
     tax: ['消費税', '税額'],
-    po: ['備考', '摘要', '発注番号', '注文番号'],
+    po: ['得意先注番', '注番', '発注番号', '注文番号', '備考', '摘要'],
   };
 
   function findHeader(rows, spec) {
@@ -680,7 +744,8 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
       for (const [key, names] of Object.entries(spec)) {
         const wanted = names.map(clean);
         // 完全一致を優先、なければ前方一致
-        let idx = cells.findIndex((c) => wanted.includes(c));
+        let idx = -1;
+        for (const w of wanted) { idx = cells.indexOf(w); if (idx >= 0) break; }
         if (idx < 0) idx = cells.findIndex((c) => c && wanted.some((w) => c.startsWith(w)));
         if (idx >= 0) map[key] = idx;
       }
@@ -733,7 +798,7 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
         id: r.id, date: r.date, slip: r.slip, maker: str(r.maker), code: str(r.code), name: str(r.name),
         qty: toNum(r.qty), price: toNum(r.price), amount: toNum(r.amount), po: str(r.po),
       }))
-      .filter((r) => r.code || r.name || r.amount);
+      .filter((r) => (r.code || r.name || r.amount) && (r.qty != null || r.amount != null));
     return s;
   }
 
@@ -742,10 +807,13 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
     if (!s) throw new Error('請求明細の見出し行（商品名・数量・単価・金額 など）が見つかりません');
     s.rows = s.rows
       .map((r) => ({
-        id: r.id, date: r.date, slip: r.slip, text: str(r.text),
+        id: r.id, date: r.date, slip: r.slip,
+        // 品名と品番が別の列なら、つなげて 1 つの「商品名」として扱う
+        text: [str(r.text), str(r.code)].filter(Boolean).join(' '),
         qty: toNum(r.qty), price: toNum(r.price), amount: toNum(r.amount), tax: toNum(r.tax), po: str(r.po),
       }))
-      .filter((r) => r.text || r.amount);
+      // 数量も金額もない行（山善 CSV の伝票見出し行など）は明細ではないので除く
+      .filter((r) => (r.text || r.amount != null) && (r.qty != null || r.amount != null));
     // 請求書鑑（当月お買上額）があれば拾う
     s.header = {};
     for (const name of wb.SheetNames) {
@@ -762,7 +830,18 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
     return s;
   }
 
-  return { readPurchases, readInvoices };
+  // ファイル（ArrayBuffer）→ ワークブック。CSV は Shift-JIS / UTF-8 を自動判別し、値は文字列のまま読む
+  function readWorkbook(XLSX, buf, filename) {
+    const bytes = new Uint8Array(buf);
+    const isCsv = /\.(csv|txt|tsv)$/i.test(filename || '');
+    if (!isCsv) return XLSX.read(bytes, { type: 'array', cellDates: false });
+    let text;
+    try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch (e) { text = new TextDecoder('shift_jis').decode(bytes); }
+    text = text.replace(/^\uFEFF/, '');
+    return XLSX.read(text, { type: 'string', raw: true, FS: /\.tsv$/i.test(filename) ? '\t' : undefined });
+  }
+
+  return { readPurchases, readInvoices, readWorkbook };
 });
 
 </script>
@@ -787,7 +866,7 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
       if (!file) return;
       $('#err').textContent = '';
       try {
-        const wb = XLSX.read(await file.arrayBuffer(), { type: 'array', cellDates: false });
+        const wb = Readers.readWorkbook(XLSX, await file.arrayBuffer(), file.name);
         state[key] = { name: file.name, wb };
         el.classList.add('done');
         el.querySelector('.file').textContent = '✓ ' + file.name;
@@ -806,7 +885,8 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
 
   function guessYear(rows) {
     for (const r of rows) {
-      if (typeof r.date === 'number') return new Date(Matcher.dayIndex(r.date) * 86400000).getUTCFullYear();
+      const d = Matcher.dayIndex(r.date);
+      if (d != null && (typeof r.date === 'number' || /\d{4}/.test(String(r.date)))) return new Date(d * 86400000).getUTCFullYear();
     }
     return new Date().getFullYear();
   }
@@ -998,7 +1078,7 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
       html += `<tr class="${MCLS[r.mark]} ${r.checked ? 'done' : ''}" data-key="${k}">`;
       if (i === 0) html += `<td class="mark" rowspan="${n}">${r.mark}</td><td class="pct" rowspan="${n}">${pctCell(r.pct)}</td>`;
       html += v
-        ? `<td>${esc(fmtDate(v.date))}</td><td>${esc(v.slip)}</td><td class="txt">${esc(v.text)}${v.po ? `<div class="sub">備考：${esc(v.po)}</div>` : ''}</td>`
+        ? `<td>${esc(fmtDate(v.date))}</td><td>${esc(v.slip)}</td><td class="txt">${esc(v.text)}${v.po ? `<div class="sub">注番・備考：${esc(v.po)}</div>` : ''}</td>`
           + `<td class="n ${qtyBad ? 'bad' : ''}">${yen(v.qty)}</td><td class="n ${priceBad ? 'bad' : ''}">${yen(v.price)}</td><td class="n">${yen(v.amount)}</td>`
         : `<td colspan="6"></td>`;
       html += p
@@ -1015,10 +1095,12 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
       html += `</tr>`;
     }
     const wantCands = state.showCands && (r.mark === '△' || r.mark === '×' || r.showCands) && !r.checked;
-    if (r.cands && r.cands.length && wantCands) {
+    // 相手が決まっている行は、今の相手より一致率の高い候補だけを出す（ノイズを減らす）
+    const cands = (r.cands || []).map((c, ci) => ({ c, ci })).filter(({ c }) => r.kind !== 'pair' || r.showCands || c.pct >= (r.pct ?? 0));
+    if (cands.length && wantCands) {
       html += `<tr class="cands" data-key="${k}"><td colspan="14"><div class="cands-title">${r.kind === 'pair' ? '他の候補' : '候補（近い順）'}</div>`
-        + r.cands.map((c, ci) => candHtml(r, c, ci)).join('') + `</td></tr>`;
-    } else if (r.cands && r.cands.length && !r.checked && r.mark !== '◎') {
+        + cands.map(({ c, ci }) => candHtml(r, c, ci)).join('') + `</td></tr>`;
+    } else if (r.cands && r.cands.length && !r.checked && r.mark !== '◎' && !r.showCands) {
       html += `<tr class="cands" data-key="${k}"><td colspan="14" style="padding-top:0"><button class="small more">候補を見る（${r.cands.length}）</button></td></tr>`;
     }
     return html;
