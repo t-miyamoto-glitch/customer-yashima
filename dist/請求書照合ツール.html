@@ -99,6 +99,11 @@ tr.cands td { background: #fafbfc; padding: 4px 8px 10px 60px; }
 .cand .miss { color: var(--m4); font-weight: 700; }
 .cands-title { font-size: 11.5px; color: var(--muted); margin: 2px 0 2px 6px; }
 
+.viewsw { display: flex; gap: 8px; margin: 16px 0 0; flex-wrap: wrap; }
+.viewsw button { text-align: left; padding: 8px 16px; border-radius: 10px; font-weight: 700; }
+.viewsw button span { display: block; font-weight: 400; font-size: 12px; color: var(--muted); }
+.viewsw button.on { background: var(--ink); color: #fff; border-color: var(--ink); }
+.viewsw button.on span { color: #d0d5dd; }
 .empty { padding: 30px; text-align: center; color: var(--muted); }
 details.help { margin-top: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; font-size: 13px; }
 details.help summary { cursor: pointer; font-weight: 600; }
@@ -136,6 +141,10 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
   </div>
 
   <section id="result" hidden>
+    <div class="viewsw" id="viewSw">
+      <button data-view="inv" class="on">請求書から見る<span>請求明細を 1 行ずつ消込する</span></button>
+      <button data-view="pur">仕入データから見る<span>請求されていない仕入（請求漏れ・翌月請求）を探す</span></button>
+    </div>
     <div class="overview" id="overview"></div>
     <div class="toolbar">
       <input type="search" id="q" placeholder="品名・品番・伝票番号・発注番号で絞り込み">
@@ -164,6 +173,7 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
         <tr><td><b style="color:var(--m4)">×</b></td><td>近い仕入行が見つからない</td><td>仕入未計上・二重請求の可能性。必要なら候補から選ぶ</td></tr>
       </table>
       <p>一致率（％）＝ 品番・品名の一致度 50％ ＋ 発注番号／伝票番号 15％ ＋ 数量・単価・金額 35％。期ズレがあるため日付は含めていません。</p>
+      <p><b>仕入データから見る</b>：仕入 1 行ずつに、対応する請求明細があるかを表示します。◎ 請求あり（一致・赤黒相殺・0円）／○ 請求あり（表記違い）または請求の締め日より後の仕入（翌月請求の見込み）／△ 請求に差異あり、または請求期間より前の仕入（前月に請求済みか確認）／× 請求期間内なのに請求がない（請求漏れ？）。</p>
       <p>作業内容（消込チェック・メモ・手動の付け替え）はこのブラウザに自動保存され、同じ請求書ファイルを読み込むと続きから再開できます。</p>
     </details>
   </section>
@@ -857,6 +867,9 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
     pool: [],          // どの請求行にも使われていない仕入行
     marks: new Set(['○', '△', '×']),
     done: 'todo', q: '', showCands: true,
+    view: 'inv',                          // 'inv' 請求書から見る / 'pur' 仕入データから見る
+    pmarks: new Set(['○', '△', '×']),    // 仕入データから見るときの表示マーク
+    pchk: {}, pmemo: {},                  // 仕入行ごとの確認チェック・メモ（キー = 仕入データの行番号）
   };
 
   // ------------------------------------------------------------ ファイル読み込み
@@ -901,6 +914,7 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
       state.rows = res.rows.filter((r) => r.v.length);
       state.pool = res.rows.filter((r) => !r.v.length).flatMap((r) => r.p.map((p) => Object.assign(p, { _poolStatus: r.status })));
       state.rows.forEach((r) => { r.checked = r.mark === '◎'; r.memo = ''; r.manual = false; });
+      state.pchk = {}; state.pmemo = {};
       restore();
       $('#result').hidden = false;
       $('#export').disabled = false;
@@ -962,7 +976,7 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
   // ------------------------------------------------------------ 作業内容の保存（このブラウザ内）
   const storeKey = () => 'invoice-recon:' + (state.inv ? state.inv.name : '');
   function save() {
-    const data = { checks: {}, memos: {}, links: {}, unlinks: [] };
+    const data = { checks: {}, memos: {}, links: {}, unlinks: [], pchk: state.pchk, pmemo: state.pmemo };
     for (const r of state.rows) {
       const k = rowKey(r);
       data.checks[k] = !!r.checked;
@@ -988,6 +1002,7 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
       if (!r || !ps.length) continue;
       linkTo(r, ps[0], true);
     }
+    state.pchk = data.pchk || {}; state.pmemo = data.pmemo || {};
     for (const r of state.rows) {
       const k = rowKey(r);
       if (k in (data.checks || {})) r.checked = data.checks[k];
@@ -1025,6 +1040,11 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
   };
 
   function render() {
+    document.querySelectorAll('#viewSw button').forEach((b) => b.classList.toggle('on', b.dataset.view === state.view));
+    $('#refBox').hidden = state.view === 'pur';
+    $('#bulk2').textContent = state.view === 'pur' ? '○ をまとめて確認済みに' : '○ をまとめて消込';
+    document.querySelector('#doneSeg [data-done="todo"]').textContent = state.view === 'pur' ? '未確認だけ' : '未消込だけ';
+    if (state.view === 'pur') return renderPur();
     const rows = state.rows;
     const total = rows.length;
     const doneN = rows.filter((r) => r.checked).length;
@@ -1122,6 +1142,148 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
       <span><button class="small pick" data-ci="${ci}">これで消込</button></span></div>`;
   }
 
+  // ------------------------------------------------------------ 仕入データから見る（逆方向）
+  const PMINFO = {
+    '◎': ['確認不要', '請求あり（一致）・赤黒・0円'],
+    '○': ['さっと目視', '表記違い／翌月請求の見込み'],
+    '△': ['要確認', '請求に差異／前月請求分？'],
+    '×': ['請求なし', '請求漏れの可能性'],
+  };
+  const OPT = { priceTol: 0.005, amountTol: 1 };
+
+  // 請求明細の日付の範囲（締め期間の目安）
+  function invoicePeriod() {
+    const days = state.rows.flatMap((r) => r.v.map((v) => v.day)).filter((d) => d != null);
+    return days.length ? { min: Math.min(...days), max: Math.max(...days) } : null;
+  }
+
+  // 仕入 1 行ずつの判定を作る
+  function buildPurRows() {
+    const per = invoicePeriod();
+    const out = [];
+    for (const r of state.rows) {
+      if (r.kind !== 'pair') continue;
+      for (const p of r.p) {
+        out.push({ p, inv: r, mark: r.mark, pct: r.pct,
+          reason: r.ok && !r.warn ? '請求あり' : '請求あり：' + r.reason, note: r.note });
+      }
+    }
+    for (const p of state.pool) {
+      let mark, reason;
+      if (p._poolStatus && p._poolStatus.startsWith('取消')) { mark = '◎'; reason = '赤黒相殺（仕入データ内で打ち消し）'; }
+      else if (!p.amount) { mark = '◎'; reason = '0円の仕入'; }
+      else if (per && p.day != null && p.day > per.max) { mark = '○'; reason = '請求の締め日より後の仕入（翌月請求の見込み）'; }
+      else if (per && p.day != null && p.day < per.min) { mark = '△'; reason = '請求期間より前の仕入（前月に請求済みか確認）'; }
+      else { mark = '×'; reason = per ? '請求期間内なのに請求がない（請求漏れ？）' : '請求なし'; }
+      out.push({ p, inv: null, mark, pct: null, reason, note: '' });
+    }
+    out.sort((a, b) => (a.p.day ?? 0) - (b.p.day ?? 0) || (a.p.id ?? 0) - (b.p.id ?? 0));
+    for (const x of out) {
+      const k = String(x.p.id);
+      x.key = k;
+      x.checked = k in state.pchk ? state.pchk[k] : x.mark === '◎';
+      x.memo = state.pmemo[k] || '';
+    }
+    return out;
+  }
+
+  // 請求のない仕入行に、近い請求明細を候補として付ける
+  function invoiceCands(p) {
+    const list = [];
+    for (const r of state.rows) {
+      const v = r.v[0];
+      if (!v || !v.amount) continue;
+      const s = Matcher.scorePair(p, v, OPT);
+      const pct = Matcher.matchPercent(s);
+      if (pct >= 40) list.push({ r, pct });
+    }
+    return list.sort((a, b) => b.pct - a.pct).slice(0, 3);
+  }
+
+  function renderPur() {
+    const rows = buildPurRows();
+    state.purRows = rows;
+    const total = rows.length;
+    const doneN = rows.filter((x) => x.checked).length;
+    const amt = (f) => rows.filter(f).reduce((a, x) => a + (x.p.amount || 0), 0);
+    let html = `<div class="box"><div class="k">仕入データの確認の進み具合</div>
+      <div class="v">${doneN} / ${total} 行</div>
+      <div class="progress"><i style="width:${total ? (100 * doneN / total).toFixed(1) : 0}%"></i></div>
+      <div class="s">請求のない仕入 ${rows.filter((x) => !x.inv).length} 行・${yen(amt((x) => !x.inv))} 円</div></div>`;
+    MARKS.forEach((m, i) => {
+      const list = rows.filter((x) => x.mark === m);
+      const left = list.filter((x) => !x.checked).length;
+      html += `<div class="box mbox m${i + 1} ${state.pmarks.has(m) ? 'on' : 'off'}" data-mark="${m}" title="クリックで表示/非表示">
+        <div class="head"><span class="mk">${m}</span><span class="what">${PMINFO[m][0]}<br><span class="muted" style="font-weight:400">${PMINFO[m][1]}</span></span></div>
+        <div class="v">${list.length}<span style="font-size:13px;font-weight:600"> 行</span></div>
+        <div class="s">${yen(list.reduce((a, x) => a + (x.p.amount || 0), 0))} 円／${left ? `未確認 ${left} 行` : '<span style="color:var(--m1)">すべて確認済み</span>'}</div></div>`;
+    });
+    $('#overview').innerHTML = html;
+
+    const q = Matcher.loose(state.q);
+    const view = rows.filter((x) => state.pmarks.has(x.mark))
+      .filter((x) => state.done === 'all' || !x.checked)
+      .filter((x) => !q || Matcher.loose([x.p.slip, x.p.code, x.p.name, x.p.po, ...(x.inv ? x.inv.v.map((v) => v.text) : [])].join(' ')).includes(q));
+    $('#viewInfo').textContent = `${view.length} 行を表示中`;
+    $('#bulk2').disabled = !rows.some((x) => x.mark === '○' && !x.checked);
+
+    const head = `<tr><th></th><th>一致率</th>
+      <th class="pur">日付</th><th class="pur">伝票</th><th class="pur">仕入データの品番／品名</th><th class="pur">数量</th><th class="pur">単価</th><th class="pur">金額</th>
+      <th class="inv">対応する請求明細</th><th class="inv">数量</th><th class="inv">単価</th><th class="inv">金額</th>
+      <th>判定理由</th><th>確認</th></tr>`;
+    if (!view.length) {
+      $('#tbl').innerHTML = head + `<tr><td colspan="14" class="empty">該当する行はありません（上のマークをクリックすると表示が切り替わります）</td></tr>`;
+      return;
+    }
+    $('#tbl').innerHTML = head + view.map(purRowHtml).join('');
+  }
+
+  function purRowHtml(x) {
+    const p = x.p, r = x.inv;
+    const vs = r ? r.v : [];
+    const n = Math.max(vs.length, 1);
+    const qtyBad = r && /数量/.test(r.status), priceBad = r && /単価/.test(r.status);
+    let html = '';
+    for (let i = 0; i < n; i++) {
+      const v = vs[i];
+      html += `<tr class="${MCLS[x.mark]} ${x.checked ? 'done' : ''}" data-pkey="${esc(x.key)}">`;
+      if (i === 0) {
+        html += `<td class="mark" rowspan="${n}">${x.mark}</td><td class="pct" rowspan="${n}">${pctCell(x.pct)}</td>`
+          + `<td rowspan="${n}">${esc(fmtDate(p.date))}</td><td rowspan="${n}">${esc(p.slip)}</td>`
+          + `<td class="txt" rowspan="${n}"><b>${esc(p.code)}</b>　<span class="sub">${esc(p.name)}</span><div class="sub">発注 ${esc(p.po)}${p.maker ? '　メーカ ' + esc(p.maker) : ''}</div></td>`
+          + `<td class="n ${qtyBad ? 'bad' : ''}" rowspan="${n}">${yen(p.qty)}</td><td class="n ${priceBad ? 'bad' : ''}" rowspan="${n}">${yen(p.price)}</td><td class="n" rowspan="${n}">${yen(p.amount)}</td>`;
+      }
+      html += v
+        ? `<td class="txt">${esc(v.text)}<div class="sub">${esc(fmtDate(v.date))}　伝票 ${esc(v.slip)}　請求書 ${esc(v.id)}行目</div></td>`
+          + `<td class="n ${qtyBad ? 'bad' : ''}">${yen(v.qty)}</td><td class="n ${priceBad ? 'bad' : ''}">${yen(v.price)}</td><td class="n">${yen(v.amount)}</td>`
+        : `<td class="txt muted" colspan="4">— この請求書には請求なし —</td>`;
+      if (i === 0) {
+        html += `<td rowspan="${n}"><div class="reason">${esc(x.reason)}</div>${x.note ? `<div class="sub">${esc(x.note)}</div>` : ''}</td>`;
+        html += `<td class="ctl" rowspan="${n}"><label class="check"><input type="checkbox" class="pchk" ${x.checked ? 'checked' : ''}>確認済</label>`
+          + `<br><input type="text" class="pmemo" value="${esc(x.memo)}" placeholder="例：11月請求で確認"></td>`;
+      }
+      html += `</tr>`;
+    }
+    if (!r && !x.checked && state.showCands && (x.mark === '×' || x.mark === '△') && x.p.amount) {
+      const cands = invoiceCands(p);
+      x.cands = cands;
+      if (cands.length) {
+        html += `<tr class="cands" data-pkey="${esc(x.key)}"><td colspan="14"><div class="cands-title">近い請求明細（すでに別の仕入行と消込済みのものも含む）</div>`
+          + cands.map((c, ci) => {
+            const v = c.r.v[0];
+            const used = c.r.kind === 'pair' ? `<span class="used">消込済み：${esc(c.r.p.map((q) => q.code).join('・'))}（${c.r.mark}）</span>` : '<span class="used" style="color:var(--m4)">相手のない請求行</span>';
+            const mk = (ok) => (ok ? 'hit' : 'miss');
+            return `<div class="cand"><span>${pctCell(c.pct)}</span><span>${esc(fmtDate(v.date))}</span><span>伝票 ${esc(v.slip)}</span>`
+              + `<span><b>${esc(v.text)}</b> <span class="sub">${esc(v.po)}　請求書 ${esc(v.id)}行目</span><br>${used}</span>`
+              + `<span class="n ${mk(p.qty === v.qty)}">${yen(v.qty)}</span><span class="n ${mk(Math.abs((p.price || 0) - (v.price || 0)) < 0.005)}">@${yen(v.price)}</span>`
+              + `<span class="n ${mk(Math.abs((p.amount || 0) - (v.amount || 0)) < 1)}">${yen(v.amount)}</span><span></span>`
+              + `<span><button class="small vpick" data-ci="${ci}">これで消込</button></span></div>`;
+          }).join('') + `</td></tr>`;
+      }
+    }
+    return html;
+  }
+
   function renderRef() {
     const pool = state.pool.filter((p) => !p._poolStatus || p._poolStatus === '仕入のみ' || !p._poolStatus.startsWith('取消'));
     const cancelled = state.pool.length - pool.length;
@@ -1136,7 +1298,14 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
     const b = e.target.closest('[data-mark]');
     if (!b) return;
     const m = b.dataset.mark;
-    state.marks.has(m) ? state.marks.delete(m) : state.marks.add(m);
+    const set = state.view === 'pur' ? state.pmarks : state.marks;
+    set.has(m) ? set.delete(m) : set.add(m);
+    render();
+  });
+  $('#viewSw').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-view]');
+    if (!b) return;
+    state.view = b.dataset.view;
     render();
   });
   $('#doneSeg').addEventListener('click', (e) => {
@@ -1149,6 +1318,13 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
   $('#q').addEventListener('input', (e) => { state.q = e.target.value; render(); });
   $('#showCands').addEventListener('change', (e) => { state.showCands = e.target.checked; render(); });
   $('#bulk2').addEventListener('click', () => {
+    if (state.view === 'pur') {
+      const plist = (state.purRows || []).filter((x) => x.mark === '○' && !x.checked);
+      if (!confirm(`○ の仕入 ${plist.length} 行をまとめて確認済みにします。`)) return;
+      plist.forEach((x) => { state.pchk[x.key] = true; });
+      save(); render();
+      return;
+    }
     const list = state.rows.filter((r) => r.mark === '○' && !r.checked);
     if (!confirm(`○ の ${list.length} 行をまとめて消込にします。\n（品名を目視で確認してから押してください）`)) return;
     list.forEach((r) => { r.checked = true; });
@@ -1159,13 +1335,35 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
     const tr = el.closest('tr[data-key]');
     return tr ? state.rows.find((r) => rowKey(r) === tr.dataset.key) : null;
   };
+  const purOf = (el) => {
+    const tr = el.closest('tr[data-pkey]');
+    return tr ? (state.purRows || []).find((x) => x.key === tr.dataset.pkey) : null;
+  };
   $('#tbl').addEventListener('change', (e) => {
+    const x = purOf(e.target);
+    if (x) {
+      if (e.target.classList.contains('pchk')) { state.pchk[x.key] = e.target.checked; save(); render(); }
+      if (e.target.classList.contains('pmemo')) { state.pmemo[x.key] = e.target.value; save(); }
+      return;
+    }
     const r = rowOf(e.target);
     if (!r) return;
     if (e.target.classList.contains('chk')) { r.checked = e.target.checked; save(); render(); }
     if (e.target.classList.contains('memo')) { r.memo = e.target.value; save(); }
   });
   $('#tbl').addEventListener('click', (e) => {
+    const x = purOf(e.target);
+    if (x) {
+      if (e.target.classList.contains('vpick')) {
+        const c = x.cands[Number(e.target.dataset.ci)];
+        if (c.r.kind === 'pair' && !confirm(`この請求明細（${c.r.v[0].id}行目）は、仕入の ${c.r.p.map((q) => q.code).join('・')} と消込済みです。\nこの仕入行に付け替えますか？`)) return;
+        const inv = state.rows.find((r) => rowKey(r) === rowKey(c.r));
+        linkTo(inv, x.p, true);
+        state.pchk[x.key] = true;
+        save(); render();
+      }
+      return;
+    }
     const r = rowOf(e.target);
     if (!r) return;
     if (e.target.classList.contains('more')) { r.showCands = true; render(); }
@@ -1210,7 +1408,17 @@ details.help table { font-size: 12.5px; margin: 8px 0; width: auto; }
     ws2['!cols'] = Object.keys(out[0] || {}).map((k) => ({ wch: /商品名|品名|理由|補足|メモ/.test(k) ? 34 : /品番|備考/.test(k) ? 18 : 9 }));
     ws2['!autofilter'] = { ref: ws2['!ref'] };
     XLSX.utils.book_append_sheet(wb, ws2, '消込結果');
-    if (ref.length) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(ref), '参考_未使用の仕入');
+    const prows = buildPurRows().map((x) => ({
+      '判定': x.mark, '判定理由': x.reason, '確認': x.checked ? '済' : '',
+      '仕入_行': x.p.id, '仕入_日付': fmtDate(x.p.date), '仕入_伝票№': x.p.slip, '仕入_品番': x.p.code, '仕入_品名': x.p.name,
+      '仕入_数量': x.p.qty, '仕入_単価': x.p.price, '仕入_金額': x.p.amount, '仕入_発注№': x.p.po,
+      '請求_行': x.inv ? x.inv.v.map((v) => v.id).join('・') : '', '請求_商品名': x.inv ? x.inv.v.map((v) => v.text).join(' ／ ') : '',
+      '請求_金額': x.inv ? x.inv.v.reduce((a, v) => a + (v.amount || 0), 0) : '', 'メモ': x.memo,
+    }));
+    const ws3 = XLSX.utils.json_to_sheet(prows);
+    ws3['!cols'] = Object.keys(prows[0] || {}).map((k) => ({ wch: /品名|商品名|理由|メモ/.test(k) ? 34 : /品番/.test(k) ? 18 : 9 }));
+    ws3['!autofilter'] = { ref: ws3['!ref'] };
+    XLSX.utils.book_append_sheet(wb, ws3, '仕入から見た照合');
     XLSX.writeFile(wb, `消込結果_${state.inv.name.replace(/\.[^.]+$/, '')}.xlsx`);
   });
 })();
